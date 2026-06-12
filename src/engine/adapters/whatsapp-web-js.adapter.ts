@@ -58,6 +58,19 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   private pushName: string | null = null;
   private callbacks: EngineEventCallbacks = {};
 
+  // Poller de respaldo: con variantes A/B recientes de WhatsApp Web el
+  // evento 'message' de wwebjs puede no dispararse jamás (wwebjs#5754,
+  // wwebjs#5765). Cada POLL_INTERVAL_MS se revisan los chats 1:1 con
+  // actividad reciente y se despacha lo no visto por el mismo camino que
+  // el evento. Si los eventos funcionan, el dedupe lo vuelve un no-op.
+  private static readonly POLL_INTERVAL_MS = 10_000;
+  private static readonly POLL_WINDOW_S = 300;
+  private static readonly SEEN_MAX = 5_000;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private pollInFlight = false;
+  private pollCutoff = 0; // epoch segundos; mensajes anteriores se ignoran
+  private seenMessageIds = new Set<string>();
+
   constructor(private readonly config: WhatsAppWebJsConfig) {
     super();
   }
@@ -146,53 +159,16 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
         this.setStatus(EngineStatus.READY);
         this.callbacks.onReady?.('', '');
       }
+      // Solo mensajes posteriores a la conexión (con 1 min de gracia):
+      // el backlog histórico no debe inundar el webhook.
+      this.pollCutoff = Math.floor(Date.now() / 1000) - 60;
+      this.startInboundPoller();
     });
 
     // eslint-disable-next-line @typescript-eslint/no-misused-promises
     this.client.on('message', async msg => {
       try {
-        const incomingMessage: IncomingMessage = {
-          id: msg.id._serialized,
-          from: msg.from,
-          to: msg.to,
-          chatId: msg.from,
-          body: msg.body,
-          type: msg.type,
-          timestamp: msg.timestamp,
-          fromMe: msg.fromMe,
-          isGroup: msg.from.endsWith('@g.us'),
-        };
-
-        // Handle media
-        if (msg.hasMedia) {
-          try {
-            const media = await msg.downloadMedia();
-            if (media) {
-              incomingMessage.media = {
-                mimetype: media.mimetype,
-                filename: media.filename || undefined,
-                data: media.data,
-              };
-            }
-          } catch (error) {
-            this.logger.error('Error downloading media', String(error));
-          }
-        }
-
-        // Handle quoted message
-        if (msg.hasQuotedMsg) {
-          try {
-            const quoted = await msg.getQuotedMessage();
-            incomingMessage.quotedMessage = {
-              id: quoted.id._serialized,
-              body: quoted.body,
-            };
-          } catch (error) {
-            this.logger.error('Error getting quoted message', String(error));
-          }
-        }
-
-        this.callbacks.onMessage?.(incomingMessage);
+        await this.emitIncoming(msg, 'event');
       } catch (error) {
         this.logger.error('Error processing incoming message', String(error));
       }
@@ -219,7 +195,128 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     this.emit('stateChanged', status);
   }
 
+  /** Construye el IncomingMessage y lo entrega a los callbacks, con dedupe. */
+  private async emitIncoming(
+    msg: import('whatsapp-web.js').Message,
+    source: 'event' | 'poller',
+  ): Promise<void> {
+    const id = msg.id._serialized;
+    if (this.seenMessageIds.has(id)) return;
+    this.seenMessageIds.add(id);
+    if (this.seenMessageIds.size > WhatsAppWebJsAdapter.SEEN_MAX) {
+      // Conserva la mitad más reciente (orden de inserción del Set)
+      const keep = Array.from(this.seenMessageIds).slice(
+        Math.floor(WhatsAppWebJsAdapter.SEEN_MAX / 2),
+      );
+      this.seenMessageIds = new Set(keep);
+    }
+
+    const incomingMessage: IncomingMessage = {
+      id,
+      from: msg.from,
+      to: msg.to,
+      chatId: msg.from,
+      body: msg.body,
+      type: msg.type,
+      timestamp: msg.timestamp,
+      fromMe: msg.fromMe,
+      isGroup: msg.from.endsWith('@g.us'),
+    };
+
+    // Handle media
+    if (msg.hasMedia) {
+      try {
+        const media = await msg.downloadMedia();
+        if (media) {
+          incomingMessage.media = {
+            mimetype: media.mimetype,
+            filename: media.filename || undefined,
+            data: media.data,
+          };
+        }
+      } catch (error) {
+        this.logger.error('Error downloading media', String(error));
+      }
+    }
+
+    // Handle quoted message
+    if (msg.hasQuotedMsg) {
+      try {
+        const quoted = await msg.getQuotedMessage();
+        incomingMessage.quotedMessage = {
+          id: quoted.id._serialized,
+          body: quoted.body,
+        };
+      } catch (error) {
+        this.logger.error('Error getting quoted message', String(error));
+      }
+    }
+
+    if (source === 'poller') {
+      this.logger.log(`Inbound recovered by poller: ${id}`);
+    }
+    this.callbacks.onMessage?.(incomingMessage);
+  }
+
+  private startInboundPoller(): void {
+    if (this.pollTimer) return;
+    this.pollTimer = setInterval(() => {
+      void this.pollInbound();
+    }, WhatsAppWebJsAdapter.POLL_INTERVAL_MS);
+  }
+
+  private stopInboundPoller(): void {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+  }
+
+  private async pollInbound(): Promise<void> {
+    if (!this.client || this.status !== EngineStatus.READY) return;
+    if (this.pollInFlight) return;
+    this.pollInFlight = true;
+    try {
+      const nowS = Math.floor(Date.now() / 1000);
+      const cutoff = Math.max(
+        this.pollCutoff,
+        nowS - WhatsAppWebJsAdapter.POLL_WINDOW_S,
+      );
+      const chats = await this.client.getChats();
+      const recent = chats
+        .filter(
+          c =>
+            !c.isGroup &&
+            typeof c.timestamp === 'number' &&
+            c.timestamp >= cutoff &&
+            c.id._serialized !== 'status@broadcast',
+        )
+        .slice(0, 10);
+      for (const chat of recent) {
+        const msgs = await chat.fetchMessages({ limit: 10 });
+        for (const msg of msgs) {
+          if (msg.fromMe) continue;
+          if (typeof msg.timestamp === 'number' && msg.timestamp < cutoff) continue;
+          if (this.seenMessageIds.has(msg.id._serialized)) continue;
+          try {
+            await this.emitIncoming(msg, 'poller');
+          } catch (error) {
+            this.logger.error('Error emitting polled message', String(error));
+          }
+        }
+      }
+      // Ventana deslizante: lo ya cubierto no se vuelve a barrer entero
+      this.pollCutoff = Math.max(this.pollCutoff, nowS - WhatsAppWebJsAdapter.POLL_WINDOW_S);
+    } catch (error) {
+      // Página caída u ocupada: el watchdog de sesión ya lo reporta
+      this.logger.warn('Inbound poller tick failed', String(error));
+    } finally {
+      this.pollInFlight = false;
+    }
+  }
+
   async disconnect(): Promise<void> {
+    this.stopInboundPoller();
     if (this.client) {
       try {
         // Use destroy instead of logout to preserve session data
@@ -235,6 +332,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   async logout(): Promise<void> {
+    this.stopInboundPoller();
     if (this.client) {
       try {
         // Logout clears session data - user will need to scan QR again
@@ -254,6 +352,7 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
   }
 
   async destroy(): Promise<void> {
+    this.stopInboundPoller();
     if (this.client) {
       await this.client.destroy();
       this.client = null;
