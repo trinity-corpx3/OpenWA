@@ -97,6 +97,14 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
           headless: this.config.puppeteer?.headless ?? true,
           args: puppeteerArgs,
         },
+        // Fija la versión de WhatsApp Web a una vigente: sin esto, WhatsApp
+        // rechaza la vinculación con "no se puede vincular en este momento".
+        webVersion: '2.3000.1041353304-alpha',
+        webVersionCache: {
+          type: 'remote',
+          remotePath:
+            'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1041353304-alpha.html',
+        },
       });
 
       this.setupEventHandlers();
